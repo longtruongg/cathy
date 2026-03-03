@@ -22,7 +22,7 @@ type AppEvent struct {
 	AppName   string `json:"appName"`            // human-readable name
 	Package   string `json:"package,omitempty"`  // optional package name
 	Duration  int64  `json:"duration,omitempty"` // only for opened-long (milliseconds)
-	// You can add more later: DeviceID, AndroidVersion, etc.
+
 }
 
 var (

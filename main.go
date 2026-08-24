@@ -1,16 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/joho/godotenv"
+	"github.com/kardianos/service"
 	"github.com/robfig/cron/v3"
 	"github.com/xuri/excelize/v2"
 	"gopkg.in/mail.v2"
@@ -22,7 +27,6 @@ type AppEvent struct {
 	AppName   string `json:"appName"`            // human-readable name
 	Package   string `json:"package,omitempty"`  // optional package name
 	Duration  int64  `json:"duration,omitempty"` // only for opened-long (milliseconds)
-
 }
 
 var (
@@ -35,7 +39,8 @@ var (
 	activeFile   string
 	liveTemplate = "bin_daily.xlsx"
 	sheetName    = "Events"
-	dataDir      = ensureDataDir()
+	dataDir      string
+	listenAddr   = ":8080"
 )
 
 type Config struct {
@@ -43,28 +48,103 @@ type Config struct {
 }
 
 func loadConfig() (*Config, error) {
-	var cfg Config
-	if err := godotenv.Load(); err != nil {
-		return nil, fmt.Errorf("Error loading .env file")
+	_ = godotenv.Load()
+	cfg := Config{
+		AppPassword: os.Getenv("APP_PASSWORD"),
+		ToMail:      os.Getenv("TO_MAIL"),
+		FromMail:    os.Getenv("FROM_MAIL"),
 	}
-	cfg.AppPassword = os.Getenv("APP_PASSWORD")
-	cfg.ToMail = os.Getenv("TO_MAIL")
-	cfg.FromMail = os.Getenv("FROM_MAIL")
+	if cfg.AppPassword == "" || cfg.ToMail == "" || cfg.FromMail == "" {
+		return nil, fmt.Errorf("APP_PASSWORD, TO_MAIL, and FROM_MAIL must be set in .env (next to the executable) or the process environment")
+	}
 	return &cfg, nil
 }
-func main() {
-	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
-	cronb := cron.New(cron.WithLocation(loc))
-	cfg, err := loadConfig()
+
+const (
+	serviceName        = "Cathy"
+	serviceDisplayName = "Cathy Activity Tracker"
+	serviceDescription = "Receives Android app activity events and emails a daily Excel report"
+)
+
+type program struct {
+	cfg        *Config
+	httpServer *http.Server
+	cron       *cron.Cron
+	logFile    *os.File
+}
+
+func executableDir() (string, error) {
+	exe, err := os.Executable()
 	if err != nil {
-		log.Fatalf("cannot load config from .env")
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return filepath.Dir(exe), nil
+	}
+	return filepath.Dir(resolved), nil
+}
+
+func setupFileLog() (*os.File, error) {
+	f, err := os.OpenFile("cathy.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	return f, nil
+}
+
+func (p *program) Start(s service.Service) error {
+	if err := p.setup(); err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		if p.cron != nil {
+			p.cron.Stop()
+		}
+		return fmt.Errorf("listen %s: %w", listenAddr, err)
+	}
+	go func() {
+		log.Printf("Server listening on http://%s", listenAddr)
+		if err := p.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("http server error: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (p *program) setup() error {
+	logFile, err := setupFileLog()
+	if err != nil {
+		log.Printf("cannot open cathy.log: %v (continuing with stdout only)", err)
+	} else {
+		p.logFile = logFile
 	}
 
-	err = todayFileExists()
+	dir, err := ensureDataDir()
 	if err != nil {
+		return err
+	}
+	dataDir = dir
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	p.cfg = cfg
+
+	if err := todayFileExists(); err != nil {
 		log.Printf("todayFileExists err: %v", err)
 	}
-	// register the daily job and check for scheduling errors
+
+	loc, err := time.LoadLocation("Asia/Ho_Chi_Minh")
+	if err != nil {
+		return fmt.Errorf("load timezone Asia/Ho_Chi_Minh: %w", err)
+	}
+
+	cronb := cron.New(cron.WithLocation(loc))
 	if _, err := cronb.AddFunc("@every 5m", func() {
 		now := time.Now().In(loc)
 		log.Printf("Cron triggered at %s — should send daily report", now.Format("2006-01-02 15:04:05 MST"))
@@ -79,29 +159,140 @@ func main() {
 			return
 		}
 
-		log.Printf("Attempting to send: %s  (size: ? bytes)", fileToSend)
-		if err := sendJobDaily(cfg); err != nil {
+		log.Printf("Attempting to send: %s", fileToSend)
+		if err := sendJobDaily(p.cfg); err != nil {
 			log.Printf("sendJobDaily failed: %v", err)
 		} else {
 			log.Println("Email sent successfully")
 		}
 	}); err != nil {
-		log.Fatalf("failed to schedule cron job: %v", err)
+		return fmt.Errorf("failed to schedule cron job: %w", err)
 	}
-	// start scheduler in background
 	cronb.Start()
-	//defer cronb.Stop()
+	p.cron = cronb
 
-	// Endpoint 1: New app installed
-	http.HandleFunc("/api/app-installed", handleAppInstalled)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/app-installed", handleAppInstalled)
+	mux.HandleFunc("/api/app-opened-long", handleAppOpenedLong)
+	mux.HandleFunc("/app-uninstalled", handleAppUnistall)
+	p.httpServer = &http.Server{Addr: listenAddr, Handler: mux}
+	return nil
+}
 
-	// Endpoint 2: App opened long time
-	http.HandleFunc("/api/app-opened-long", handleAppOpenedLong)
-	// send when Bin unistall
-	http.HandleFunc("/app-uninstalled", handleAppUnistall)
-	addr := ":8080"
-	log.Printf("Server listening on http://%s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+func (p *program) Stop(s service.Service) error {
+	log.Println("service stopping")
+	if p.cron != nil {
+		cronCtx := p.cron.Stop()
+		select {
+		case <-cronCtx.Done():
+		case <-time.After(8 * time.Second):
+			log.Println("timed out waiting for cron jobs")
+		}
+	}
+	if p.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.httpServer.Shutdown(ctx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+	}
+	log.Println("service stopped")
+	if p.logFile != nil {
+		_ = p.logFile.Close()
+	}
+	return nil
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `%s
+
+Usage:
+  cathy.exe              Run in the foreground (or as a Windows service when started by SCM)
+  cathy.exe install      Install as a Windows service (run as Administrator)
+  cathy.exe uninstall    Remove the Windows service
+  cathy.exe start        Start the service
+  cathy.exe stop         Stop the service
+  cathy.exe restart      Restart the service
+  cathy.exe status       Show service status
+
+Put .env next to the executable. Logs are written to cathy.log in that same folder.
+`, serviceDisplayName)
+}
+
+func main() {
+	exeDir, err := executableDir()
+	if err != nil {
+		log.Fatalf("cannot resolve executable directory: %v", err)
+	}
+	// Windows services start in C:\Windows\System32. `go run` puts the binary
+	// in a temp dir, so only force the exe directory when SCM is launching us
+	// or when .env actually sits next to the binary.
+	if !service.Interactive() {
+		if err := os.Chdir(exeDir); err != nil {
+			log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
+		}
+	} else if _, err := os.Stat(".env"); err != nil {
+		if _, err := os.Stat(filepath.Join(exeDir, ".env")); err == nil {
+			if err := os.Chdir(exeDir); err != nil {
+				log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
+			}
+		}
+	}
+
+	svcConfig := &service.Config{
+		Name:             serviceName,
+		DisplayName:      serviceDisplayName,
+		Description:      serviceDescription,
+		WorkingDirectory: exeDir,
+		Option: service.KeyValue{
+			"StartType":              "automatic",
+			"OnFailure":              "restart",
+			"OnFailureDelayDuration": "5s",
+		},
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatalf("cannot create service: %v", err)
+	}
+
+	if len(os.Args) > 1 {
+		cmd := os.Args[1]
+		switch cmd {
+		case "install", "uninstall", "start", "stop", "restart":
+			if err := service.Control(s, cmd); err != nil {
+				log.Fatalf("%s failed: %v", cmd, err)
+			}
+			log.Printf("%s %s succeeded", serviceName, cmd)
+			return
+		case "status":
+			st, err := s.Status()
+			if err != nil {
+				log.Fatalf("status failed: %v", err)
+			}
+			switch st {
+			case service.StatusRunning:
+				fmt.Println("running")
+			case service.StatusStopped:
+				fmt.Println("stopped")
+			default:
+				fmt.Println("unknown")
+			}
+			return
+		case "-h", "-help", "--help", "help":
+			printUsage()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
+			printUsage()
+			os.Exit(2)
+		}
+	}
+
+	if err := s.Run(); err != nil {
+		log.Fatalf("service run failed: %v", err)
+	}
 }
 
 type UninstallEvent struct {
@@ -112,8 +303,8 @@ type UninstallEvent struct {
 func getTodayFileName() string {
 	dateStr := time.Now().In(time.FixedZone("Asia/Ho_Chi_Minh", 7*3600)).Format("2006-01-02")
 	return fmt.Sprintf("%s/bin_%s.xlsx", dataDir, dateStr)
-
 }
+
 func todayFileExists() error {
 	excelMutex.Lock()
 	defer excelMutex.Unlock()
@@ -196,6 +387,7 @@ func todayFileExists() error {
 
 	return nil
 }
+
 func handleAppUnistall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -227,13 +419,15 @@ func clearExcelData() error {
 	}
 	return nil
 }
-func ensureDataDir() string {
+
+func ensureDataDir() (string, error) {
 	dir := "data"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Fatalf("Cannot create data directory: %v", err)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create data directory: %w", err)
 	}
-	return dir
+	return dir, nil
 }
+
 func formatDuration(d string) string {
 	loc := time.FixedZone("GMT+7", 7*60*60)
 	t, err := time.Parse(time.RFC3339Nano, d)
@@ -245,7 +439,6 @@ func formatDuration(d string) string {
 
 // Handler for new app install
 func handleAppInstalled(w http.ResponseWriter, r *http.Request) {
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
@@ -276,6 +469,7 @@ func handleAppInstalled(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"status":"success","event_type":"installed"}`)
 }
+
 func durationOpend(x int64) string {
 	durationSec := x / 1000
 	durationMin := durationSec / 60
@@ -322,8 +516,8 @@ func handleAppOpenedLong(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"status":"success","event_type":"opened_long"}`)
-
 }
+
 func sendJobDaily(cfg *Config) error {
 	if err := todayFileExists(); err != nil {
 		return fmt.Errorf("no file exists %s", err)
@@ -359,8 +553,12 @@ var packageCategories = map[string]string{
 	"com.zhiliaoapp.musically": "Social", // TikTok
 
 	// Games
-	"com.supercell.clashofclans": "Game",
-	"com.mojang.minecraftpe":     "Game",
+	"com.supercell.clashofclans":      "Game",
+	"com.mojang.minecraftpe":          "Game",
+	"com.dts.freefireth":              "Game",
+	"com.dts.freefiremax":             "Game",
+	"com.riotgames.league.wildriftvn": "Game",
+	"com.garena.game.kgvn":            "Game",
 
 	// Video
 	"com.google.android.youtube": "Video",
@@ -382,6 +580,7 @@ func getCategory(packageName string) string {
 	}
 	return "other"
 }
+
 func initFile() error {
 	if _, err := os.Stat(liveTemplate); os.IsNotExist(err) {
 		f := excelize.NewFile()
@@ -411,7 +610,7 @@ func initFile() error {
 		if err != nil {
 			return fmt.Errorf("cannnot create row style: %v", err)
 		}
-		var mapSheet = map[string]string{
+		mapSheet := map[string]string{
 			"A": "A",
 			"B": "B",
 			"C": "C",
@@ -421,7 +620,6 @@ func initFile() error {
 		}
 
 		for k, v := range mapSheet {
-
 			if err = f.SetColWidth(sheetName, k, v, 30); err != nil {
 				return fmt.Errorf("cannnot create col width: %v", err)
 			}
@@ -434,6 +632,7 @@ func initFile() error {
 	}
 	return nil
 }
+
 func saveItToExcel(event AppEvent, eventType string) error {
 	excelMutex.Lock()
 	defer excelMutex.Unlock()
@@ -493,6 +692,7 @@ func saveItToExcel(event AppEvent, eventType string) error {
 	log.Printf("Saved event to %s row %d", activeFile, nextRow)
 	return nil
 }
+
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil

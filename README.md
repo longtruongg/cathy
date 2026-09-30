@@ -37,7 +37,7 @@ go build -o cathy.exe .
 Copy these files into one folder, for example `C:\Cathy\`:
 
 - `cathy.exe`
-- `.env` (see `.env.example`)
+- `.env` (see `.env`)
 - `install-windows-service.ps1` (optional helper)
 
 `.env` must contain:

@@ -55,7 +55,7 @@ func loadConfig() (*Config, error) {
 		FromMail:    os.Getenv("FROM_MAIL"),
 	}
 	if cfg.AppPassword == "" || cfg.ToMail == "" || cfg.FromMail == "" {
-		return nil, fmt.Errorf("APP_PASSWORD, TO_MAIL, and FROM_MAIL must be set in .env (next to the executable) or the process environment")
+		return nil, fmt.Errorf("APP_PASSWORD, TO_MAIL, and FROM_MAIL must be set in .env.example (next to the executable) or the process environment")
 	}
 	return &cfg, nil
 }
@@ -215,7 +215,7 @@ Usage:
   cathy.exe restart      Restart the service
   cathy.exe status       Show service status
 
-Put .env next to the executable. Logs are written to cathy.log in that same folder.
+Put .env.example next to the executable. Logs are written to cathy.log in that same folder.
 `, serviceDisplayName)
 }
 
@@ -226,13 +226,13 @@ func main() {
 	}
 	// Windows services start in C:\Windows\System32. `go run` puts the binary
 	// in a temp dir, so only force the exe directory when SCM is launching us
-	// or when .env actually sits next to the binary.
+	// or when .env.example actually sits next to the binary.
 	if !service.Interactive() {
 		if err := os.Chdir(exeDir); err != nil {
 			log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
 		}
-	} else if _, err := os.Stat(".env"); err != nil {
-		if _, err := os.Stat(filepath.Join(exeDir, ".env")); err == nil {
+	} else if _, err := os.Stat(".env.example"); err != nil {
+		if _, err := os.Stat(filepath.Join(exeDir, ".env.example")); err == nil {
 			if err := os.Chdir(exeDir); err != nil {
 				log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
 			}
@@ -551,15 +551,19 @@ var packageCategories = map[string]string{
 	"com.facebook.katana":      "Social",
 	"com.instagram.android":    "Social",
 	"com.zhiliaoapp.musically": "Social", // TikTok
+	"com.instagram.barcelona":  "thread",
 
 	// Games
-	"com.supercell.clashofclans":      "Game",
-	"com.mojang.minecraftpe":          "Game",
-	"com.dts.freefireth":              "Game",
-	"com.dts.freefiremax":             "Game",
-	"com.riotgames.league.wildriftvn": "Game",
-	"com.garena.game.kgvn":            "Game",
-
+	"com.supercell.clashofclans":              "Game",
+	"com.mojang.minecraftpe":                  "Game",
+	"com.dts.freefireth":                      "Game",
+	"com.dts.freefiremax":                     "Game",
+	"com.riotgames.league.wildriftvn":         "Game",
+	"com.garena.game.kgvn":                    "Game",
+	"com.roblox.client":                       "Game",
+	"com.roblox.client.vnggames":              "Game",
+	"com.riotgames.league.teamfighttacticsvn": "Game",
+	"com.riotgames.league.teamfighttactics":   "Game",
 	// Video
 	"com.google.android.youtube": "Video",
 	"com.netflix.mediaclient":    "Video",

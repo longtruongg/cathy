@@ -10,6 +10,7 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 $Exe = Join-Path $Root "cathy.exe"
 $FirewallName = "Cathy Activity Tracker"
+$MdnsFirewallName = "Cathy mDNS"
 
 if (-not (Test-Path $Exe)) {
     Write-Error "cathy.exe not found in $Root. Build it first: go build -o cathy.exe ."
@@ -20,6 +21,11 @@ function Set-CathyFirewall {
     if (-not $existing) {
         New-NetFirewallRule -DisplayName $FirewallName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
         Write-Host "Opened inbound TCP $Port ($FirewallName)"
+    }
+    $mdns = Get-NetFirewallRule -DisplayName $MdnsFirewallName -ErrorAction SilentlyContinue
+    if (-not $mdns) {
+        New-NetFirewallRule -DisplayName $MdnsFirewallName -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow | Out-Null
+        Write-Host "Opened inbound UDP 5353 ($MdnsFirewallName)"
     }
 }
 
@@ -40,6 +46,7 @@ switch ($Command) {
         & $Exe stop
         & $Exe uninstall
         Get-NetFirewallRule -DisplayName $FirewallName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        Get-NetFirewallRule -DisplayName $MdnsFirewallName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         Write-Host "Cathy service uninstalled"
     }
     default {

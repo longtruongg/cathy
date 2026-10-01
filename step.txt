@@ -1,0 +1,21 @@
+1 : GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o cathy.exe .
+2 : Install as a service (PowerShell, as Administrator, on the Windows machine)
+powershell
+cd C:\cathy
+.\cathy.exe install
+.\cathy.exe start
+3:  check status  { .\cathy.exe status
+# or
+Get-Service Cathy
+}
+
+4: avoid Windows defender 
+   # run as Administrator
+Add-MpPreference -ExclusionPath "C:\cathy"
+Add-MpPreference -ExclusionProcess "cathy.exe"
+
+verify : Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+
+5 : firewall maybe 
+New-NetFirewallRule -DisplayName "Cathy Backend" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+New-NetFirewallRule -DisplayName "Cathy mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow

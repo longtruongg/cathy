@@ -81,7 +81,7 @@ Or: `services.msc` → **Cathy Activity Tracker**.
 
 To test without installing a service, run `.\cathy.exe` in a console (Ctrl+C stops it).
 
-The Android app must call this PC's **LAN IP** (not `localhost`), e.g. `http://192.168.1.20:8080`.
+The Android app does not use a fixed IP. On startup this server advertises `_cathy._tcp` (instance `cathy`, port 8080) with Hashicorp mDNS. The phone browses that same service type when it is on the home Wi-Fi. UDP 5353 must be allowed inbound; `install-windows-service.ps1` opens it.
 
 ## API Endpoints
 

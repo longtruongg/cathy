@@ -14,6 +14,7 @@ import (
 	"time"
 	_ "time/tzdata"
 
+	"github.com/hashicorp/mdns"
 	"github.com/joho/godotenv"
 	"github.com/kardianos/service"
 	"github.com/robfig/cron/v3"
@@ -21,12 +22,25 @@ import (
 	"gopkg.in/mail.v2"
 )
 
-// AppEvent Common structure for both endpoints (flexible)
-type AppEvent struct {
-	Timestamp string `json:"timestamp"`          // ISO format, e.g. "2026-02-28T17:45:00+07:00"
-	AppName   string `json:"appName"`            // human-readable name
-	Package   string `json:"package,omitempty"`  // optional package name
-	Duration  int64  `json:"duration,omitempty"` // only for opened-long (milliseconds)
+type AppOpenedLong struct {
+	Timestamp    string `json:"timestamp"`
+	AppName      string `json:"appName"`
+	Package      string `json:"package"`
+	Duration     int64  `json:"duration"`
+	SessionStart int64  `json:"sessionStart"`
+	DeviceID     string `json:"deviceId"`
+}
+
+type PackageChange struct {
+	Timestamp string `json:"timestamp"`
+	AppName   string `json:"appName"`
+	Package   string `json:"package"`
+	DeviceID  string `json:"deviceId"`
+}
+
+type UninstallEvent struct {
+	Reason    string `json:"reason"`
+	Timestamp string `json:"timestamp"`
 }
 
 var (
@@ -34,13 +48,12 @@ var (
 	excelMutex    sync.Mutex
 	categoryCache = map[string]string{}
 	cacheMutex    sync.RWMutex
-	// cron schedule for 19:00 daily (no leading space)
-	sendTime     = "0 19 * * *"
-	activeFile   string
-	liveTemplate = "bin_daily.xlsx"
-	sheetName    = "Events"
-	dataDir      string
-	listenAddr   = ":8080"
+	// cron: minute hour day month weekday → every day at 19:45
+	sendTime   = "45 19 * * *"
+	activeFile string
+	sheetName  = "Events"
+	dataDir    string
+	listenAddr = ":8080"
 )
 
 type Config struct {
@@ -55,7 +68,7 @@ func loadConfig() (*Config, error) {
 		FromMail:    os.Getenv("FROM_MAIL"),
 	}
 	if cfg.AppPassword == "" || cfg.ToMail == "" || cfg.FromMail == "" {
-		return nil, fmt.Errorf("APP_PASSWORD, TO_MAIL, and FROM_MAIL must be set in .env.example (next to the executable) or the process environment")
+		return nil, fmt.Errorf("APP_PASSWORD, TO_MAIL, and FROM_MAIL must be set in .env (next to the executable) or the process environment")
 	}
 	return &cfg, nil
 }
@@ -71,6 +84,7 @@ type program struct {
 	httpServer *http.Server
 	cron       *cron.Cron
 	logFile    *os.File
+	mdns       *mdns.Server
 }
 
 func executableDir() (string, error) {
@@ -105,6 +119,11 @@ func (p *program) Start(s service.Service) error {
 			p.cron.Stop()
 		}
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
+	}
+	if srv, err := advertise(ln.Addr().(*net.TCPAddr).Port); err != nil {
+		log.Printf("mdns advertise failed: %v", err)
+	} else {
+		p.mdns = srv
 	}
 	go func() {
 		log.Printf("Server listening on http://%s", listenAddr)
@@ -145,21 +164,10 @@ func (p *program) setup() error {
 	}
 
 	cronb := cron.New(cron.WithLocation(loc))
-	if _, err := cronb.AddFunc("@every 5m", func() {
+	if _, err := cronb.AddFunc(sendTime, func() {
 		now := time.Now().In(loc)
-		log.Printf("Cron triggered at %s — should send daily report", now.Format("2006-01-02 15:04:05 MST"))
+		log.Printf("Cron triggered at %s — sending daily report", now.Format("2006-01-02 15:04:05 MST"))
 
-		fileToSend := activeFile
-		if fileToSend == "" {
-			log.Println("ERROR: activeFile is empty!")
-			return
-		}
-		if !fileExists(fileToSend) {
-			log.Printf("ERROR: file not found: %s", fileToSend)
-			return
-		}
-
-		log.Printf("Attempting to send: %s", fileToSend)
 		if err := sendJobDaily(p.cfg); err != nil {
 			log.Printf("sendJobDaily failed: %v", err)
 		} else {
@@ -174,13 +182,19 @@ func (p *program) setup() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/app-installed", handleAppInstalled)
 	mux.HandleFunc("/api/app-opened-long", handleAppOpenedLong)
-	mux.HandleFunc("/app-uninstalled", handleAppUnistall)
+	mux.HandleFunc("/api/app-uninstalled", handleAppUninstall)
+	mux.HandleFunc("/app-uninstalled", handleAppUninstall) // back-compat alias
 	p.httpServer = &http.Server{Addr: listenAddr, Handler: mux}
 	return nil
 }
 
 func (p *program) Stop(s service.Service) error {
 	log.Println("service stopping")
+	if p.mdns != nil {
+		if err := p.mdns.Shutdown(); err != nil {
+			log.Printf("mdns shutdown: %v", err)
+		}
+	}
 	if p.cron != nil {
 		cronCtx := p.cron.Stop()
 		select {
@@ -215,7 +229,7 @@ Usage:
   cathy.exe restart      Restart the service
   cathy.exe status       Show service status
 
-Put .env.example next to the executable. Logs are written to cathy.log in that same folder.
+Put .env next to the executable. Logs are written to cathy.log in that same folder.
 `, serviceDisplayName)
 }
 
@@ -224,15 +238,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("cannot resolve executable directory: %v", err)
 	}
-	// Windows services start in C:\Windows\System32. `go run` puts the binary
-	// in a temp dir, so only force the exe directory when SCM is launching us
-	// or when .env.example actually sits next to the binary.
 	if !service.Interactive() {
 		if err := os.Chdir(exeDir); err != nil {
 			log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
 		}
-	} else if _, err := os.Stat(".env.example"); err != nil {
-		if _, err := os.Stat(filepath.Join(exeDir, ".env.example")); err == nil {
+	} else if _, err := os.Stat(".env"); err != nil {
+		if _, err := os.Stat(filepath.Join(exeDir, ".env")); err == nil {
 			if err := os.Chdir(exeDir); err != nil {
 				log.Fatalf("cannot change working directory to %s: %v", exeDir, err)
 			}
@@ -295,100 +306,75 @@ func main() {
 	}
 }
 
-type UninstallEvent struct {
-	Reason    string `json:"reason"`
-	Timestamp string `json:"timestamp"`
-}
-
 func getTodayFileName() string {
 	dateStr := time.Now().In(time.FixedZone("Asia/Ho_Chi_Minh", 7*3600)).Format("2006-01-02")
 	return fmt.Sprintf("%s/bin_%s.xlsx", dataDir, dateStr)
 }
 
+// todayFileExists makes sure activeFile points at TODAY's file, not just any
+// file that happens to still be on disk. Fixes the bug where activeFile,
+// once set, never rotated past the day it was created.
 func todayFileExists() error {
 	excelMutex.Lock()
 	defer excelMutex.Unlock()
 
-	if activeFile != "" && fileExists(activeFile) {
-		return nil // already good
-	}
-
 	todayFile := getTodayFileName()
 
-	// If today's file already exists → just use it
+	if activeFile == todayFile && fileExists(activeFile) {
+		return nil // already on today's file
+	}
+
 	if fileExists(todayFile) {
 		activeFile = todayFile
 		log.Printf("Using existing daily file: %s", activeFile)
 		return nil
 	}
 
-	// Create new file
 	f := excelize.NewFile()
 	defer f.Close()
 
-	// Rename default sheet
 	if err := f.SetSheetName("Sheet1", sheetName); err != nil {
 		return fmt.Errorf("failed to set sheet name: %w", err)
 	}
 
-	// Write headers - row 1, columns A to F
-	headers := []string{
-		"Timestamp",
-		"App Name",
-		"Package",
-		"Category",
-		"Duration",
-		"Event Type",
-	}
-
+	headers := []string{"Timestamp", "App Name", "Package", "Category", "Duration", "Event Type"}
 	for colIdx, header := range headers {
-		// column number starts at 1 (A=1, B=2, ...)
 		cell, err := excelize.CoordinatesToCellName(colIdx+1, 1)
 		if err != nil {
 			return fmt.Errorf("failed to get cell name for col %d, row 1: %w", colIdx+1, err)
 		}
-
 		if err := f.SetCellValue(sheetName, cell, header); err != nil {
 			return fmt.Errorf("failed to set header %q at %s: %w", header, cell, err)
 		}
 	}
 
-	// Header style (apply once for row 1)
 	style, err := f.NewStyle(&excelize.Style{
 		Font: &excelize.Font{Bold: true},
-		Fill: excelize.Fill{
-			Type:    "pattern",
-			Color:   []string{"#D9E1F2"},
-			Pattern: 1,
-		},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"#D9E1F2"}, Pattern: 1},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create header style: %w", err)
 	}
-
 	if err := f.SetRowStyle(sheetName, 1, 1, style); err != nil {
 		return fmt.Errorf("failed to apply header style to row 1: %w", err)
 	}
 
-	// Column widths
 	for _, col := range []string{"A", "B", "C", "D", "E", "F"} {
 		if err := f.SetColWidth(sheetName, col, col, 30); err != nil {
 			return fmt.Errorf("failed to set column width %s: %w", col, err)
 		}
 	}
 
-	// Save
 	if err := f.SaveAs(todayFile); err != nil {
 		return fmt.Errorf("failed to save new file %s: %w", todayFile, err)
 	}
 
 	activeFile = todayFile
 	log.Printf("Created new daily file: %s", activeFile)
-
 	return nil
 }
 
-func handleAppUnistall(w http.ResponseWriter, r *http.Request) {
+func handleAppUninstall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
@@ -410,16 +396,6 @@ func handleAppUnistall(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"status":"success"}`)
 }
 
-// clearExcelData removes all data rows from the spreadsheet but keeps the header
-func clearExcelData() error {
-	excelMutex.Lock()
-	defer excelMutex.Unlock()
-	if _, err := os.Stat(liveTemplate); os.IsNotExist(err) {
-		return fmt.Errorf("livetemplate  does not exist, create it %s", liveTemplate)
-	}
-	return nil
-}
-
 func ensureDataDir() (string, error) {
 	dir := "data"
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -437,7 +413,9 @@ func formatDuration(d string) string {
 	return t.In(loc).Format("2-1-2006 15:04:05 GMT+7")
 }
 
-// Handler for new app install
+// handleAppInstalled also receives uninstall-shaped payloads from the Kotlin
+// side (PackageChangePayload: no duration field) — Duration/SessionStart
+// just come through as 0, which is fine for the "installed"/"uninstalled" rows.
 func handleAppInstalled(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -451,7 +429,7 @@ func handleAppInstalled(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var event AppEvent
+	var event AppOpenedLong
 	if err := json.Unmarshal(body, &event); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
@@ -459,11 +437,13 @@ func handleAppInstalled(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[INSTALLED] %s → App: %s (%s)",
 		formatDuration(event.Timestamp), event.AppName, event.Package)
-	err = saveItToExcel(event, "installed")
-	if err != nil {
+
+	if err := todayFileExists(); err != nil {
+		log.Printf("todayFileExists err: %v", err)
+	}
+	if err := saveItToExcel(event, "installed"); err != nil {
 		log.Printf("save it got -> %s", err)
 	}
-	// TODO: Save to database, send notification, etc.
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -485,7 +465,6 @@ func durationOpend(x int64) string {
 	return durationStr
 }
 
-// Handler for long-opened app
 func handleAppOpenedLong(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -499,7 +478,7 @@ func handleAppOpenedLong(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var event AppEvent
+	var event AppOpenedLong
 	if err := json.Unmarshal(body, &event); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
@@ -508,11 +487,13 @@ func handleAppOpenedLong(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[OPENED_LONG] %s → App: %s (%s), Duration: %d ms (~%s min)",
 		formatDuration(event.Timestamp), event.AppName, event.Package, event.Duration, durationOpend(event.Duration))
 
-	// TODO: Save to database, send notification, etc.
-	err = saveItToExcel(event, "Opening long")
-	if err != nil {
+	if err := todayFileExists(); err != nil {
+		log.Printf("todayFileExists err: %v", err)
+	}
+	if err := saveItToExcel(event, "Opening long"); err != nil {
 		log.Printf("save it got err %s", err.Error())
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"status":"success","event_type":"opened_long"}`)
@@ -525,10 +506,12 @@ func sendJobDaily(cfg *Config) error {
 	excelMutex.Lock()
 	fileToSend := activeFile
 	excelMutex.Unlock()
+
 	if !fileExists(fileToSend) {
 		log.Printf("No data file to send today (%s)", fileToSend)
-		return fmt.Errorf("no file to send ") // or send empty email — your choice
+		return fmt.Errorf("no file to send")
 	}
+
 	msg := mail.NewMessage()
 	msg.SetHeader("From", cfg.FromMail)
 	msg.SetHeader("To", cfg.ToMail)
@@ -546,14 +529,12 @@ func sendJobDaily(cfg *Config) error {
 }
 
 var packageCategories = map[string]string{
-	// Social
 	"com.twitter.android":      "Social",
 	"com.facebook.katana":      "Social",
 	"com.instagram.android":    "Social",
-	"com.zhiliaoapp.musically": "Social", // TikTok
+	"com.zhiliaoapp.musically": "Social",
 	"com.instagram.barcelona":  "thread",
 
-	// Games
 	"com.supercell.clashofclans":              "Game",
 	"com.mojang.minecraftpe":                  "Game",
 	"com.dts.freefireth":                      "Game",
@@ -564,80 +545,37 @@ var packageCategories = map[string]string{
 	"com.roblox.client.vnggames":              "Game",
 	"com.riotgames.league.teamfighttacticsvn": "Game",
 	"com.riotgames.league.teamfighttactics":   "Game",
-	// Video
+
 	"com.google.android.youtube": "Video",
 	"com.netflix.mediaclient":    "Video",
 
-	// Browser
 	"com.microsoft.emmx":  "Browser",
 	"com.android.chrome":  "Browser",
 	"org.mozilla.firefox": "Browser",
 
-	// Shopping
 	"com.shopee.vn":           "Shopping",
 	"vn.tiki.app.tikiandroid": "Shopping",
 }
 
 func getCategory(packageName string) string {
-	if cat, ok := packageCategories[packageName]; ok {
+	cacheMutex.RLock()
+	if cat, ok := categoryCache[packageName]; ok {
+		cacheMutex.RUnlock()
 		return cat
 	}
-	return "other"
-}
+	cacheMutex.RUnlock()
 
-func initFile() error {
-	if _, err := os.Stat(liveTemplate); os.IsNotExist(err) {
-		f := excelize.NewFile()
-		err := f.SetSheetName("Sheet1", sheetName)
-		if err != nil {
-			return fmt.Errorf("cannnot create sheet: %v", err)
-		}
-		headers := []string{"Timestamp", "App Name", "Package", "Category", "Duration", "Event Type"}
-		for i, h := range headers {
-			cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-			err := f.SetCellValue(sheetName, cell, h)
-			if err != nil {
-				return fmt.Errorf("cannnot create cell: %v", err)
-			}
-		}
-
-		// Style headers bold
-		style, _ := f.NewStyle(&excelize.Style{
-			Font: &excelize.Font{Bold: true},
-			Fill: excelize.Fill{
-				Type:    "pattern",
-				Color:   []string{"#D9E1F2"},
-				Pattern: 1,
-			},
-		})
-		err = f.SetRowStyle(sheetName, 1, 1, style)
-		if err != nil {
-			return fmt.Errorf("cannnot create row style: %v", err)
-		}
-		mapSheet := map[string]string{
-			"A": "A",
-			"B": "B",
-			"C": "C",
-			"D": "D",
-			"E": "E",
-			"F": "F",
-		}
-
-		for k, v := range mapSheet {
-			if err = f.SetColWidth(sheetName, k, v, 30); err != nil {
-				return fmt.Errorf("cannnot create col width: %v", err)
-			}
-		}
-		if err := f.SaveAs(liveTemplate); err != nil {
-			return fmt.Errorf("Failed to create Excel file: %v", err)
-		}
-
-		return nil
+	cat, ok := packageCategories[packageName]
+	if !ok {
+		cat = "other"
 	}
-	return nil
+	cacheMutex.Lock()
+	categoryCache[packageName] = cat
+	cacheMutex.Unlock()
+	return cat
 }
 
-func saveItToExcel(event AppEvent, eventType string) error {
+func saveItToExcel(event AppOpenedLong, eventType string) error {
 	excelMutex.Lock()
 	defer excelMutex.Unlock()
 
@@ -647,9 +585,6 @@ func saveItToExcel(event AppEvent, eventType string) error {
 	}
 	defer f.Close()
 
-	// Make sure sheet exists
-
-	// Get number of rows safely
 	rows, err := f.GetRows(sheetName)
 	if err != nil {
 		return fmt.Errorf("GetRows failed on %q: %w", sheetName, err)
@@ -657,7 +592,7 @@ func saveItToExcel(event AppEvent, eventType string) error {
 
 	nextRow := len(rows) + 1
 	if nextRow < 2 {
-		nextRow = 2 // force start from row 2 (after header)
+		nextRow = 2
 	}
 
 	category := getCategory(event.Package)
@@ -672,18 +607,12 @@ func saveItToExcel(event AppEvent, eventType string) error {
 		eventType,
 	}
 
-	// Column A=1, B=2, ..., F=6
-	if len(values) > 6 {
-		return fmt.Errorf("too many values (%d) - max 6 columns supported", len(values))
-	}
-
 	for colIdx, value := range values {
-		column := colIdx + 1 // 1-based
+		column := colIdx + 1
 		cellName, err := excelize.CoordinatesToCellName(column, nextRow)
 		if err != nil {
 			return fmt.Errorf("invalid coordinates col=%d row=%d: %w", column, nextRow, err)
 		}
-
 		if err := f.SetCellValue(sheetName, cellName, value); err != nil {
 			return fmt.Errorf("SetCellValue failed at %s (value=%v): %w", cellName, value, err)
 		}

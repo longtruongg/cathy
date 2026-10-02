@@ -42,6 +42,14 @@ type UninstallEvent struct {
 	Reason    string `json:"reason"`
 	Timestamp string `json:"timestamp"`
 }
+type GameSession struct {
+	AppName      string `json:"appName"`
+	Package      string `json:"package"`
+	SessionStart int64  `json:"sessionStart"`
+	SessionEnd   int64  `json:"sessionEnd"`
+	Duration     int64  `json:"duration"`
+	DeviceID     string `json:"deviceId"`
+}
 
 var (
 	subject       = "Bin Daily activities"
@@ -49,7 +57,7 @@ var (
 	categoryCache = map[string]string{}
 	cacheMutex    sync.RWMutex
 	// cron: minute hour day month weekday → every day at 19:45
-	sendTime   = "45 19 * * *"
+	sendTime   = "40 20 * * *" // 20:40pm
 	activeFile string
 	sheetName  = "Events"
 	dataDir    string
@@ -184,8 +192,69 @@ func (p *program) setup() error {
 	mux.HandleFunc("/api/app-opened-long", handleAppOpenedLong)
 	mux.HandleFunc("/api/app-uninstalled", handleAppUninstall)
 	mux.HandleFunc("/app-uninstalled", handleAppUninstall) // back-compat alias
+	mux.HandleFunc("/api/game-session", handleGameSession)
 	p.httpServer = &http.Server{Addr: listenAddr, Handler: mux}
 	return nil
+}
+
+func handleGameSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	defer r.Body.Close()
+
+	var s GameSession
+	if err := json.Unmarshal(body, &s); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	start := time.UnixMilli(s.SessionStart).In(time.FixedZone("GMT+7", 7*3600))
+	end := time.UnixMilli(s.SessionEnd).In(time.FixedZone("GMT+7", 7*3600))
+	log.Printf("[GAME_SESSION] %s: %s → %s (%s)",
+		s.AppName, start.Format("15:04:05"), end.Format("15:04:05"), durationOpend(s.Duration))
+
+	if err := todayFileExists(); err != nil {
+		log.Printf("todayFileExists err: %v", err)
+	}
+	if err := saveGameSession(s, start, end); err != nil {
+		log.Printf("save game session err: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, `{"status":"success"}`)
+}
+
+func saveGameSession(s GameSession, start time.Time, end time.Time) interface{} {
+	excelMutex.Lock()
+	defer excelMutex.Unlock()
+
+	f, err := excelize.OpenFile(activeFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	const sheet = "GameSessions"
+	sheetIdx, _ := f.GetSheetIndex(sheet)
+	if _, err := f.GetSheetIndex(sheet); err != nil || sheetIdx == -1 {
+		f.NewSheet(sheet)
+		f.SetSheetRow(sheet, "A1", &[]string{"App", "Package", "Start", "Stop", "Duration"})
+	}
+
+	rows, _ := f.GetRows(sheet)
+	nextRow := len(rows) + 1
+	cell, _ := excelize.CoordinatesToCellName(1, nextRow)
+	row := []interface{}{
+		s.AppName, s.Package,
+		start.Format("15:04:05"), end.Format("15:04:05"),
+		durationOpend(s.Duration),
+	}
+	f.SetSheetRow(sheet, cell, &row)
+	return f.Save()
 }
 
 func (p *program) Stop(s service.Service) error {
@@ -529,32 +598,34 @@ func sendJobDaily(cfg *Config) error {
 }
 
 var packageCategories = map[string]string{
-	"com.twitter.android":      "Social",
-	"com.facebook.katana":      "Social",
-	"com.instagram.android":    "Social",
-	"com.zhiliaoapp.musically": "Social",
-	"com.instagram.barcelona":  "thread",
+	"com.twitter.android":             "Social",
+	"com.facebook.katana":             "Facebook",
+	"com.instagram.android":           "Instagram",
+	"com.zhiliaoapp.musically":        "Tik Tok",
+	"com.instagram.barcelona":         "Thread",
+	"com.ss.android.ugc.aweme":        "Douyin",
+	"com.ss.android.ugc.aweme.mobile": "Douyin",
 
-	"com.supercell.clashofclans":              "Game",
-	"com.mojang.minecraftpe":                  "Game",
-	"com.dts.freefireth":                      "Game",
-	"com.dts.freefiremax":                     "Game",
-	"com.riotgames.league.wildriftvn":         "Game",
-	"com.garena.game.kgvn":                    "Game",
-	"com.roblox.client":                       "Game",
-	"com.roblox.client.vnggames":              "Game",
-	"com.riotgames.league.teamfighttacticsvn": "Game",
-	"com.riotgames.league.teamfighttactics":   "Game",
+	"com.supercell.clashofclans":              "Class of Clan",
+	"com.mojang.minecraftpe":                  "Minecraft",
+	"com.dts.freefireth":                      "Free Fire Game",
+	"com.dts.freefiremax":                     "Free Fire Game",
+	"com.riotgames.league.wildriftvn":         "LMHT: Toc Chien",
+	"com.garena.game.kgvn":                    "Garena Lien Quan Mobile",
+	"com.roblox.client":                       "Roblox Game",
+	"com.roblox.client.vnggames":              "Roblox Viet Nam",
+	"com.riotgames.league.teamfighttacticsvn": "Đấu Trường Chân Lý",
+	"com.riotgames.league.teamfighttactics":   "Đấu Trường Chân Lý",
 
-	"com.google.android.youtube": "Video",
-	"com.netflix.mediaclient":    "Video",
+	"com.google.android.youtube": "Youtube",
+	"com.netflix.mediaclient":    "Netflix",
 
 	"com.microsoft.emmx":  "Browser",
-	"com.android.chrome":  "Browser",
-	"org.mozilla.firefox": "Browser",
+	"com.android.chrome":  "Chrome",
+	"org.mozilla.firefox": "Firefox",
 
-	"com.shopee.vn":           "Shopping",
-	"vn.tiki.app.tikiandroid": "Shopping",
+	"com.shopee.vn":           "Shopee",
+	"vn.tiki.app.tikiandroid": "Tik Tok shop",
 }
 
 func getCategory(packageName string) string {
@@ -567,7 +638,7 @@ func getCategory(packageName string) string {
 
 	cat, ok := packageCategories[packageName]
 	if !ok {
-		cat = "other"
+		cat = packageName //search by hands
 	}
 	cacheMutex.Lock()
 	categoryCache[packageName] = cat
@@ -590,10 +661,7 @@ func saveItToExcel(event AppOpenedLong, eventType string) error {
 		return fmt.Errorf("GetRows failed on %q: %w", sheetName, err)
 	}
 
-	nextRow := len(rows) + 1
-	if nextRow < 2 {
-		nextRow = 2
-	}
+	nextRow := max(len(rows)+1, 2)
 
 	category := getCategory(event.Package)
 	durStr := durationOpend(event.Duration)

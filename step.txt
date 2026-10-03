@@ -19,3 +19,11 @@ verify : Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
 5 : firewall maybe 
 New-NetFirewallRule -DisplayName "Cathy Backend" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
 New-NetFirewallRule -DisplayName "Cathy mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
+
+
+3. Add to Windows Startup
+
+Press Win + R
+Type: shell:startup
+Enter
+Put a shortcut to C:\Cathy\start-cathy.bat in that folder

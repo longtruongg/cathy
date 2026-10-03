@@ -228,7 +228,7 @@ func handleGameSession(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"status":"success"}`)
 }
 
-func saveGameSession(s GameSession, start time.Time, end time.Time) interface{} {
+func saveGameSession(s GameSession, start time.Time, end time.Time) error {
 	excelMutex.Lock()
 	defer excelMutex.Unlock()
 
@@ -239,10 +239,10 @@ func saveGameSession(s GameSession, start time.Time, end time.Time) interface{} 
 	defer f.Close()
 
 	const sheet = "GameSessions"
-	sheetIdx, _ := f.GetSheetIndex(sheet)
-	if _, err := f.GetSheetIndex(sheet); err != nil || sheetIdx == -1 {
+	sheetIdx, err := f.GetSheetIndex(sheet)
+	if err != nil || sheetIdx == -1 {
 		f.NewSheet(sheet)
-		f.SetSheetRow(sheet, "A1", &[]string{"App", "Package", "Start", "Stop", "Duration"})
+		_ = f.SetSheetRow(sheet, "A1", &[]string{"App", "Package", "Start", "Stop", "Duration"})
 	}
 
 	rows, _ := f.GetRows(sheet)
@@ -253,7 +253,7 @@ func saveGameSession(s GameSession, start time.Time, end time.Time) interface{} 
 		start.Format("15:04:05"), end.Format("15:04:05"),
 		durationOpend(s.Duration),
 	}
-	f.SetSheetRow(sheet, cell, &row)
+	_ = f.SetSheetRow(sheet, cell, &row)
 	return f.Save()
 }
 
@@ -449,20 +449,39 @@ func handleAppUninstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Cannot read request body", http.StatusBadRequest)
+		return
+	}
 	defer r.Body.Close()
 
-	var event UninstallEvent
+	// Android sends PackageChangePayload (same shape as install).
+	var event PackageChange
 	if err := json.Unmarshal(body, &event); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	formatted := formatDuration(event.Timestamp)
-	log.Printf("[UNINSTALL_REASON] %s → Reason: %s", formatted, event.Reason)
+	log.Printf("[UNINSTALLED] %s → App: %s (%s)",
+		formatDuration(event.Timestamp), event.AppName, event.Package)
+
+	if err := todayFileExists(); err != nil {
+		log.Printf("todayFileExists err: %v", err)
+	}
+	row := AppOpenedLong{
+		Timestamp: event.Timestamp,
+		AppName:   event.AppName,
+		Package:   event.Package,
+		DeviceID:  event.DeviceID,
+	}
+	if err := saveItToExcel(row, "uninstalled"); err != nil {
+		log.Printf("save uninstall err: %v", err)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `{"status":"success"}`)
+	fmt.Fprint(w, `{"status":"success","event_type":"uninstalled"}`)
 }
 
 func ensureDataDir() (string, error) {
@@ -638,7 +657,7 @@ func getCategory(packageName string) string {
 
 	cat, ok := packageCategories[packageName]
 	if !ok {
-		cat = packageName //search by hands
+		cat = packageName // search by hands
 	}
 	cacheMutex.Lock()
 	categoryCache[packageName] = cat

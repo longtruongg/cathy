@@ -9,14 +9,14 @@ cd C:\cathy
 Get-Service Cathy
 }
 
-4: avoid Windows defender 
+4: avoid Windows defender
    # run as Administrator
 Add-MpPreference -ExclusionPath "C:\cathy"
 Add-MpPreference -ExclusionProcess "cathy.exe"
 
 verify : Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
 
-5 : firewall maybe 
+5 : firewall maybe
 New-NetFirewallRule -DisplayName "Cathy Backend" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
 New-NetFirewallRule -DisplayName "Cathy mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
 

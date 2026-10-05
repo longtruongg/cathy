@@ -10,9 +10,9 @@ import (
 )
 
 // Same DNS-SD name the Android app browses via NsdManager.
-// NsdManager writes it as "_cathy._tcp." (trailing dot); this library stores
+// NsdManager writes it as "_katty._tcp." (trailing dot); this library stores
 // it without the dot — keep both sides in sync if you ever rename this.
-const mdnsServiceType = "_cathy._tcp"
+const mdnsServiceType = "_katty._tcp"
 
 // advertise registers the mDNS record for this backend on the LAN.
 // Called from program.Start() with the actual bound port (in case
@@ -27,7 +27,7 @@ func advertise(port int) (*mdns.Server, error) {
 		return nil, fmt.Errorf("no usable LAN IPv4 address found to advertise")
 	}
 
-	instance := strings.ToLower(serviceName) // "cathy", from main.go's serviceName const
+	instance := strings.ToLower(serviceName) // "katty", from main.go serviceName ("Katty")
 	host := instance + ".local."
 
 	svc, err := mdns.NewMDNSService(

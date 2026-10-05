@@ -1,0 +1,19 @@
+1: setting it up to run as a service to be suck
+2: Switch it to something like Unikey
+3: remove old services ( 8080 ports...)
+  - nssm stop Cathy
+  - nssm remove Cathy confirm
+  + check full
+  - Get-Service | Where-Object {$_.DisplayName -like "*cathy*" -or $_.Name -like "*cathy*"}
+  - netstat -ano | findstr :8080
+  - taskkill /PID <pid> /F
+  + verify
+  - Get-Service Cathy
+  - sc.exe query Cathy
+  + force it
+  - taskkill /IM cathy.exe /F
+    nssm remove Cathy confirm
+
+4: Go build :no black console window
+  -GOOS=windows GOARCH=amd64 go build -ldflags="-H=windowsgui -s -w" -o cathy.exe .
+5: create Desktop entry if wana use
